@@ -354,8 +354,6 @@ def render_rays(ray_batch,
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
-    #print(f"rays_d: {rays_d}")
-    #print(f"viewdirs: {viewdirs}")
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
@@ -382,39 +380,27 @@ def render_rays(ray_batch,
             t_rand = torch.Tensor(t_rand)
 
         z_vals = lower + (upper - lower) * t_rand
-    #print(f"z_vals shape: {z_vals.shape}")
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
-    #print(f"points shape: {pts.shape}")
-    #print(f"viewdir shape: {viewdirs.shape}")
 
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
-    #print(f"raw: {raw}")
-    #print(f"raw.shape: {raw.shape}")
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-    #print(f"rgb_map shape: {rgb_map.shape}")
-    #print(f"disp_map shape: {disp_map.shape}")
-    #print(f"acc_map shape: {acc_map.shape}")
 
-    # Add this block to print and filter non-zero depth values
+    # depthが0の場合は点を計算できないため除去
     non_zero_depths = depth_map[depth_map != 0]
     if non_zero_depths.numel() > 0:
-        #print("Non-zero depth values:", non_zero_depths)
-        #print("shape: ", non_zero_depths.shape)
         
-        # Filter rays_o and rays_d based on non-zero depth values
+        # depthが0でない光線のrays_o, rays_dだけを取得
         valid_indices = depth_map != 0
         rays_o = rays_o[valid_indices]
         rays_d = rays_d[valid_indices]
         
-        #print("Filtered rays_o.shape:", rays_o.shape)
-        #print("Filtered rays_d.shape:", rays_d.shape)
     else:
         raise ValueError("no values")
-
+    
+    #得られたdepthを用いて観察する点を計算
     observed_pts = rays_o + rays_d * non_zero_depths[..., None]
-    #print(f"observed_pts: {observed_pts}, shape: {observed_pts.shape}")
 
     # 軽度（経度）方向に36度ずつ、緯度方向に18度ずつの分割
     longitude_step = 36  # 経度方向のステップ（度）
@@ -445,38 +431,33 @@ def render_rays(ray_batch,
             y /= norm
             z /= norm
             
-            # 方向���クトルとして追加
+            # 方向ベクトルとして追加
             direction_vectors.append([x, y, z])
 
     # NumPy配列からPyTorchテンソルに変換
     direction_vectors_tensor = torch.tensor(direction_vectors, dtype=torch.float)
 
-    # observed_ptsからランダムに100点を選択
+    # observed_ptsからランダムに100点を選択(全て調べると多すぎるので)
     num_samples = min(100, observed_pts.shape[0])
     sampled_indices = np.random.choice(observed_pts.shape[0], num_samples, replace=False)
     sampled_pts = observed_pts[sampled_indices]
 
-    #print(f"sampled_pts: {sampled_pts}")
-
     # 選択された点に対してすべての方向ベクトルを適用
-    #all_alpha = []
     for i, observed_pt in enumerate(sampled_pts):
-        print(f"observed_pt: {observed_pt}")
         # 各点に対してすべての方向ベクトルを適用
         repeated_pts = observed_pt.repeat(direction_vectors_tensor.shape[0], 1).unsqueeze(1).float()
         raw = network_query_fn(repeated_pts, direction_vectors_tensor, network_fn)
         raw = raw.squeeze(1)
 
+        #raw2outputsだとz_vals, ray_dが必要だったので、とりあえず手動で透過度を計算
         sigma = F.relu(raw[..., 3])
-        #print(f"sigma: {sigma}")
         delta = 7.0e-2
         alpha = 1.0 - torch.exp(-sigma * delta)
 
+        #画像にするために２次元に拡張
         alpha_map = alpha.view(len(longitudes), len(latitudes))
-
-        print(f"alpha_map: {alpha_map}")
         
-        # Save alpha_map as an image without displaying
+        # alpha_mapを画像として保存
         filename = f"./results/{uuid.uuid4()}.png"
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         plt.imsave(filename, alpha_map.cpu().numpy(), cmap='gray', vmin=0, vmax=1)
@@ -484,6 +465,8 @@ def render_rays(ray_batch,
         # 進行状況を表示
         if (i + 1) % 10 == 0 or (i + 1) == len(sampled_pts):
             print(f"Progress: {i + 1}/{len(sampled_pts)} points processed")
+
+    #最初のbatchの結果だけ見るため
     raise ValueError("An error occurred during processing.")
 
     if N_importance > 0:
